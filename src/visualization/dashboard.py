@@ -1,376 +1,466 @@
-import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
-import pandas as pd
+"""Shared dashboard: explicit provenance, TCC risk rules and temporal evaluation."""
+
+from html import escape
+
 import numpy as np
-from typing import Dict, List
-import sys
-import os
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from src.analysis import analyze
+from src.models.risk_classifier import RISK_COLORS
+from src.utils.helpers import format_number
+from src.visualization.theme import (
+    ROOT,
+    header,
+    icon,
+    info_box,
+    section,
+    user_badge,
+    warning_box,
+)
 
-from src.utils.helpers import get_risk_color, format_number
 
-class Dashboard:
+@st.cache_data(show_spinner=False, max_entries=8)
+def cached_analysis(raw, months, safety):
+    return analyze(raw, months, safety)
 
-    def __init__(self):
-        self.colors = {
-            'primary': '#1f77b4',
-            'secondary': '#ff7f0e',
-            'success': '#00CC66',
-            'warning': '#FFA500',
-            'danger': '#FF4B4B'
-        }
-    
-    def show_kpis(self, metrics: Dict):
-        col1, col2, col3, col4, col5 = st.columns(5)
-        
-        with col1:
-            st.metric(
-                label="Total de Medicamentos",
-                value=metrics.get('total_medicamentos', 0)
-            )
-        
-        with col2:
-            alto = metrics.get('risco_alto', 0)
-            st.metric(
-                label="🔴 Alertas Alto Risco",
-                value=alto,
-                delta=f"{metrics.get('percentual_alto', 0)}%" if alto > 0 else None,
-                delta_color="inverse"
-            )
-        
-        with col3:
-            medio = metrics.get('risco_medio', 0)
-            st.metric(
-                label="🟡 Alertas Médio Risco",
-                value=medio,
-                delta=f"{metrics.get('percentual_medio', 0)}%" if medio > 0 else None,
-                delta_color="inverse"
-            )
-        
-        with col4:
-            deficit = metrics.get('deficit_total', 0)
-            st.metric(
-                label="Déficit Total",
-                value=f"{deficit:,.0f}".replace(',', '.'),
-                help="Quantidade total de unidades em falta"
-            )
-        
-        with col5:
-            r2 = metrics.get('model_r2', 0)
-            st.metric(
-                label="Acurácia Modelo (R²)",
-                value=f"{r2:.1%}" if r2 > 0 else "N/A"
-            )
-    
-    def show_critical_alerts(self, high_risk_df: pd.DataFrame):
-        if high_risk_df.empty:
-            return
-        cols = st.columns(min(len(high_risk_df), 5))
-        
-        for idx, (_, row) in enumerate(high_risk_df.iterrows()):
-            if idx >= 5: 
-                break
-            
-            with cols[idx]:
-                medicamento = row['medicamento']
-                estoque = row.get('estoque_atual', 0)
-                previsao = row.get('consumo_previsto', 0)
-                deficit = row.get('deficit', 0)
 
-                st.markdown(f"""
-                <div style="
-                    background: linear-gradient(135deg, #ff4b4b 0%, #ff6b6b 100%);
-                    padding: 15px;
-                    border-radius: 10px;
-                    border-left: 5px solid #cc0000;
-                    box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-                    color: white;
-                    margin-bottom: 10px;
-                ">
-                    <h4 style="margin: 0; font-size: 14px; color: white;"> {medicamento}</h4>
-                    <hr style="margin: 8px 0; border-color: rgba(255,255,255,0.3);">
-                    <p style="margin: 3px 0; font-size: 12px;"><b>Estoque:</b> {estoque:,.0f}</p>
-                    <p style="margin: 3px 0; font-size: 12px;"><b>Previsão:</b> {previsao:,.0f}</p>
-                    <p style="margin: 3px 0; font-size: 12px;"><b>Déficit:</b> 🔻 {deficit:,.0f}</p>
-                </div>
-                """.replace(',', '.'), unsafe_allow_html=True)
-    
-    def plot_historical_vs_prediction(self, historical: pd.DataFrame, predictions: pd.DataFrame, medicamento: str):
-        hist_med = historical[historical['medicamento'] == medicamento].copy()
-        pred_med = predictions[predictions['medicamento'] == medicamento].copy()
-        
-        if hist_med.empty:
-            st.warning(f"Sem dados históricos para {medicamento}")
-            return
+def read_csv(source):
+    """Accept Brazilian spreadsheets exported with either commas or semicolons."""
+    return pd.read_csv(source, sep=None, engine="python")
 
-        hist_med = hist_med.sort_values('data')
-        pred_med = pred_med.sort_values('data')
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=hist_med['data'],
-            y=hist_med['consumo'],
-            mode='lines+markers',
-            name='Histórico',
-            line=dict(color=self.colors['primary'], width=2),
-            marker=dict(size=6)
-        ))
 
-        if not pred_med.empty:
-            fig.add_trace(go.Scatter(
-                x=pred_med['data'],
-                y=pred_med['consumo_previsto'],
-                mode='lines+markers',
-                name='Predição',
-                line=dict(color=self.colors['secondary'], width=2, dash='dash'),
-                marker=dict(size=8, symbol='diamond')
-            ))
+def chart_style(fig, height=340):
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="Inter, sans-serif", color="#1e3d38", size=12),
+        margin=dict(l=10, r=20, t=20, b=20),
+        legend=dict(orientation="h", y=1.12, x=0, font=dict(size=12)),
+    )
+    fig.update_xaxes(showgrid=False, tickfont=dict(size=11))
+    fig.update_yaxes(gridcolor="#e1e8e1", tickfont=dict(size=11))
+    return fig
 
-        fig.update_layout(
-            title=f'Consumo Histórico vs Predição - {medicamento}',
-            xaxis_title='Mês',
-            yaxis_title='Consumo (unidades)',
-            hovermode='x unified',
-            template='plotly_white',
-            height=400
+
+def show_kpis(risks):
+    counts = risks["nivel_risco"].value_counts()
+    cards = [
+        (
+            "Séries analisadas",
+            len(risks),
+            "Uma série por unidade e medicamento",
+            "pill",
+            "",
+        ),
+        (
+            "Prioridade alta",
+            counts.get("Alto", 0),
+            "Índice de risco acima de 1,3",
+            "triangle-alert",
+            "critical",
+        ),
+        (
+            "Em atenção",
+            counts.get("Médio", 0),
+            "Índice entre 1,0 e 1,3",
+            "shield-check",
+            "warning",
+        ),
+        (
+            "Dados pendentes",
+            counts.get("Sem dados", 0),
+            "Séries sem classificação no recorte",
+            "database",
+            "muted",
+        ),
+    ]
+    content = "".join(
+        f'<div class="kpi {style}">'
+        f'<div class="kpi-top">{label}{icon(symbol)}</div>'
+        f'<div class="kpi-value">{value}</div>'
+        f'<div class="kpi-note">{note}</div>'
+        f'</div>'
+        for label, value, note, symbol, style in cards
+    )
+    st.markdown(f'<div class="kpi-grid">{content}</div>', unsafe_allow_html=True)
+
+
+def show_alerts(risks):
+    high = (
+        risks[risks["nivel_risco"].eq("Alto")].sort_values("indice_risco", ascending=False).head(3)
+    )
+    if high.empty:
+        st.markdown(
+            f'<div class="custom-success">{icon("check-circle-2")}'
+            f'<span>Nenhum alerta de risco alto no recorte selecionado.</span></div>',
+            unsafe_allow_html=True,
         )
-        
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def plot_risk_distribution(self, risk_stats: Dict):
-        labels = ['🔴 Alto', '🟡 Médio', '🟢 Baixo']
-        values = [
-            risk_stats.get('Alto', 0),
-            risk_stats.get('Médio', 0),
-            risk_stats.get('Baixo', 0)
-        ]
-        colors = ['#FF4B4B', '#FFA500', '#00CC66']
-        fig = go.Figure(data=[go.Pie(
-            labels=labels,
-            values=values,
-            marker=dict(colors=colors),
-            hole=0.4,
-            textinfo='label+percent',
-            textposition='outside'
-        )])
-        fig.update_layout(
-            title='Distribuição de Níveis de Risco',
-            height=400,
-            showlegend=True
-        )
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def show_enhanced_risk_table(self, risk_df: pd.DataFrame):
-        if risk_df.empty:
-            st.info("📋 Nenhum dado disponível")
-            return
+        return
+    for column, (_, row) in zip(st.columns(len(high)), high.iterrows()):
+        with column:
+            st.markdown(
+                f'<div class="alert-card">'
+                f'<div class="alert-label">{icon("triangle-alert")} PRIORIDADE ALTA</div>'
+                f'<h3>{escape(row["medicamento"])}</h3>'
+                f'<p>{escape(row["unidade"])}</p>'
+                f'<p>Saldo de {escape(row["data_estoque"])}: <strong>{format_number(row["estoque_atual"], 0)}</strong></p>'
+                f'<p>Reposição estimada: <strong>{format_number(np.ceil(row["deficit"]), 0)}</strong></p>'
+                f'<p>Avaliar compra ou redistribuição.</p>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-        table_data = []
-        for _, row in risk_df.iterrows():
-            table_data.append({
-                'Status': row.get('emoji_risco', '⚪'),
-                'Medicamento': row.get('medicamento', 'N/A'),
-                'Estoque Atual': f"{int(row.get('estoque_atual', 0)):,}".replace(',', '.'),
-                'Consumo Previsto (3m)': f"{int(row.get('consumo_previsto', 0)):,}".replace(',', '.'),
-                'Déficit': f"{int(row.get('deficit', 0)):,}".replace(',', '.') if row.get('deficit', 0) > 0 else '-',
-                'Razão Estoque/Previsão': f"{row.get('razao_estoque', 0):.2f}x",
-                'Nível': row.get('nivel_risco', 'N/A')
-            })
-        
-        result_df = pd.DataFrame(table_data)
-        st.dataframe(
-            result_df,
-            use_container_width=True,
-            height=min(450, len(result_df) * 35 + 38)
-        )
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric(
-                "Total de Registros",
-                len(result_df)
-            )
-        with col2:
-            total_deficit = risk_df['deficit'].sum() if 'deficit' in risk_df.columns else 0
-            st.metric(
-                "Déficit Total",
-                f"{int(total_deficit):,}".replace(',', '.')
-            )
-        with col3:
-            media_razao = risk_df['razao_estoque'].mean() if 'razao_estoque' in risk_df.columns else 0
-            st.metric(
-                "Razão Média",
-                f"{media_razao:.2f}x"
-            )
-    
-    def show_risk_table(self, risk_df: pd.DataFrame):
-        if risk_df.empty:
-            st.info("Nenhum dado disponível")
-            return
- 
-        display_cols = ['emoji_risco', 'medicamento', 'estoque_atual', 
-                       'consumo_previsto', 'deficit', 'nivel_risco']
 
-        available_cols = [col for col in display_cols if col in risk_df.columns]
-        table_df = risk_df[available_cols].copy()
-        column_mapping = {
-            'emoji_risco': 'Status',
-            'medicamento': 'Medicamento',
-            'estoque_atual': 'Estoque',
-            'consumo_previsto': 'Prev. 3 Meses',
-            'deficit': 'Déficit',
-            'nivel_risco': 'Nível de Risco'
-        }
-        
-        table_df = table_df.rename(columns={k: v for k, v in column_mapping.items() if k in table_df.columns})
+def show_risk_table(risks):
+    columns = {
+        "unidade": "Unidade",
+        "medicamento": "Medicamento",
+        "data_estoque": "Mês do saldo",
+        "estoque_atual": "Saldo disponível",
+        "consumo_previsto": "Demanda prevista",
+        "estoque_seguranca": "Reserva de segurança",
+        "necessidade_total": "Necessidade total",
+        "indice_risco": "Índice de risco",
+        "deficit": "Reposição estimada",
+        "nivel_risco": "Risco",
+        "acao_sugerida": "Ação sugerida",
+    }
+    table = risks[list(columns)].rename(columns=columns)
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            label: st.column_config.NumberColumn(label, format="%.1f")
+            for key, label in columns.items()
+            if key
+            in (
+                "estoque_atual",
+                "consumo_previsto",
+                "estoque_seguranca",
+                "necessidade_total",
+                "indice_risco",
+                "deficit",
+            )
+        },
+    )
+    st.caption(
+        "Quantidades na unidade de cada medicamento. Valores de apresentações diferentes não são somados. Reposição inclui a reserva de segurança."
+    )
 
-        for col in ['Estoque', 'Prev. 3 Meses', 'Déficit']:
-            if col in table_df.columns:
-                table_df[col] = table_df[col].apply(lambda x: f"{int(x):,}".replace(',', '.'))
 
-        def highlight_risk(row):
-            if 'Nível de Risco' in row:
-                risk = row['Nível de Risco']
-                if risk == 'Alto':
-                    return ['background-color: #FFE5E5'] * len(row)
-                elif risk == 'Médio':
-                    return ['background-color: #FFF4E5'] * len(row)
-                else:
-                    return ['background-color: #E5F9F0'] * len(row)
-            return [''] * len(row)
-        st.dataframe(
-            table_df.style.apply(highlight_risk, axis=1),
-            use_container_width=True,
-            height=400
-        )
-    
-    def plot_deficit_ranking(self, risk_df: pd.DataFrame, top_n: int = 10):
-        if risk_df.empty or 'deficit' not in risk_df.columns:
-            st.warning("Dados insuficientes para o gráfico")
-            return
-        deficit_df = risk_df[risk_df['deficit'] > 0].copy()
-        
-        if deficit_df.empty:
-            st.success("Nenhum medicamento com déficit!")
-            return
-        deficit_df = deficit_df.sort_values('deficit', ascending=True).tail(top_n)
-        colors = deficit_df['nivel_risco'].map({
-            'Alto': '#FF4B4B',
-            'Médio': '#FFA500',
-            'Baixo': '#00CC66'
-        })
-        fig = go.Figure(data=[
-            go.Bar(
-                x=deficit_df['deficit'],
-                y=deficit_df['medicamento'],
-                orientation='h',
-                marker=dict(color=colors),
-                text=deficit_df['deficit'].apply(lambda x: f"{int(x):,}".replace(',', '.')),
-                textposition='outside'
-            )
-        ])
-        fig.update_layout(
-            title=f'Top {top_n} Medicamentos por Déficit',
-            xaxis_title='Déficit (unidades)',
-            yaxis_title='',
-            height=max(350, top_n * 35),
-            template='plotly_white',
-            showlegend=False
-        )       
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def plot_top_medications(self, df: pd.DataFrame, metric: str = 'consumo', top_n: int = 10):
-        if df.empty or metric not in df.columns:
-            st.warning("Dados insuficientes para o gráfico")
-            return
+def select_series(frame, unit, medicine):
+    return frame[frame["unidade"].eq(unit) & frame["medicamento"].eq(medicine)]
 
-        top_df = df.groupby('medicamento')[metric].sum().sort_values(ascending=False).head(top_n)
-        fig = go.Figure(data=[
-            go.Bar(
-                x=top_df.values,
-                y=top_df.index,
-                orientation='h',
-                marker=dict(color=self.colors['primary'])
-            )
-        ])
-        fig.update_layout(
-            title=f'Top {top_n} Medicamentos por {metric.capitalize()}',
-            xaxis_title=metric.capitalize(),
-            yaxis_title='Medicamento',
-            height=400,
-            template='plotly_white'
-        )       
-        st.plotly_chart(fig, use_container_width=True)
-    
-    def plot_model_metrics(self, metrics: Dict):
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            mae = metrics.get('test_mae', 0)
-            st.metric(
-                label="MAE (Erro Médio Absoluto)",
-                value=f"{mae:.0f}",
-                help="Quanto menor, melhor"
-            )
-        
-        with col2:
-            rmse = metrics.get('test_rmse', 0)
-            st.metric(
-                label="RMSE (Raiz do Erro Quadrático)",
-                value=f"{rmse:.0f}",
-                help="Quanto menor, melhor"
-            )
-        
-        with col3:
-            r2 = metrics.get('test_r2', 0)
-            st.metric(
-                label="R² (Coeficiente de Determinação)",
-                value=f"{r2:.3f}",
-                help="Quanto mais próximo de 1, melhor"
-            )
-    
-    def show_filters(self) -> Dict:
-        st.sidebar.header("🔍 Filtros")
-        filters = {}
-        st.sidebar.subheader("Período")
-        filters['months_history'] = st.sidebar.slider(
-            "Meses de histórico",
-            min_value=6,
-            max_value=24,
-            value=12,
-            step=3
+
+def show_forecast(result, risks):
+    choices = list(zip(risks["unidade"], risks["medicamento"]))
+    if not choices:
+        info_box("Selecione ao menos um nível de risco para explorar as previsões.")
+        return
+    labels = [f"{index + 1}. {unit} / {medicine}" for index, (unit, medicine) in enumerate(choices)]
+    selected = st.selectbox("Unidade / medicamento", labels)
+    unit, medicine = choices[labels.index(selected)]
+    history = select_series(result.history, unit, medicine)
+    prediction = select_series(result.predictions, unit, medicine)
+    window = st.select_slider("Histórico exibido (meses)", options=[6, 12, 18, 24, 36], value=12)
+    history = history.tail(window)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=history["data"],
+            y=history["consumo"],
+            name="Consumo observado",
+            line=dict(color="#227767", width=2.5),
+            mode="lines+markers",
+            marker=dict(size=6, color="#227767"),
         )
-        st.sidebar.subheader("Predição")
-        filters['months_prediction'] = st.sidebar.slider(
-            "Meses a prever",
-            min_value=1,
-            max_value=6,
-            value=3,
-            step=1
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=prediction["data"],
+            y=prediction["consumo_previsto"],
+            name="Previsão",
+            line=dict(color="#b57825", width=2.5, dash="dash"),
+            mode="lines+markers",
+            marker=dict(size=6, color="#b57825", symbol="diamond"),
         )
-        st.sidebar.subheader("Nível de Risco")
-        filters['risk_filter'] = st.sidebar.multiselect(
-            "Filtrar por risco",
-            options=['Alto', 'Médio', 'Baixo'],
-            default=['Alto', 'Médio', 'Baixo']
+    )
+    fig.update_layout(hovermode="x unified", yaxis_title="Quantidade na unidade do medicamento")
+    st.plotly_chart(chart_style(fig, 380), use_container_width=True)
+    row = select_series(risks, unit, medicine).iloc[0]
+    for col, key, label in zip(
+        st.columns(4),
+        ["estoque_atual", "consumo_previsto", "estoque_seguranca", "necessidade_total"],
+        [
+            "Saldo disponível",
+            "Demanda no horizonte",
+            "Reserva de segurança",
+            "Necessidade total",
+        ],
+    ):
+        col.metric(label, "Não informado" if pd.isna(row[key]) else format_number(row[key], 1))
+    st.caption(
+        f"Saldo referente a {row['data_estoque']}. Previsões pontuais; intervalos de incerteza ainda não estimados."
+    )
+
+
+def show_method(result, months, safety, source):
+    section("Como interpretar os resultados", "clipboard-list")
+    st.write(
+        f"Reserva de segurança: **{safety:.0%}** da demanda prevista nos próximos **{months} meses após o último registro de cada série**."
+    )
+    st.code(
+        "Necessidade total = demanda prevista + reserva de segurança\nÍndice de risco = necessidade total / saldo disponível",
+        language=None,
+    )
+    st.write("**Baixo:** índice < 1,0 · **Médio:** 1,0 ≤ índice ≤ 1,3 · **Alto:** índice > 1,3.")
+    st.caption(
+        "Saldo zero com demanda positiva gera risco alto. Saldo desconhecido ou saldo e demanda ambos zero geram 'Sem dados'. Limiares ilustrativos do TCC, ainda sem calibração municipal."
+    )
+    section(
+        "Avaliação temporal",
+        "bar-chart-3",
+        "Comparação retrospectiva por unidade e medicamento; R² não é acurácia.",
+    )
+    st.write(
+        f"Os últimos {months} meses de cada série são reservados para teste. O modelo prevê todo esse intervalo sem acessar seus consumos reais. A referência simples repete o último consumo conhecido. Depois da avaliação, o modelo é treinado novamente com todo o histórico."
+    )
+    evaluation = result.metrics.copy()
+    evaluation["supera_baseline"] = np.where(
+        evaluation["mae"] < evaluation["mae_baseline"], "Sim", "Não"
+    )
+    st.dataframe(
+        evaluation.rename(
+            columns={
+                "unidade": "Unidade",
+                "medicamento": "Medicamento",
+                "mae": "MAE",
+                "rmse": "RMSE",
+                "r2": "R²",
+                "mae_baseline": "MAE da referência",
+                "supera_baseline": "Supera referência",
+                "treino_ate": "Treino até",
+                "teste_de": "Teste de",
+                "teste_ate": "Teste até",
+                "meses_teste": "Meses em teste",
+            }
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption(
+        "MAE e RMSE menores indicam erros menores. R² fica indisponível para teste de um mês ou consumo constante. Uma única janela de teste não comprova generalização operacional."
+    )
+    section("Origem e limitações", "file-text")
+    st.write(
+        f"**Base:** {source}. **Período:** {result.history['data'].min()} a {result.history['data'].max()}. **Registros:** {len(result.history)}."
+    )
+    st.write(
+        "A integração automática ao DATASUS não está ativa. O modelo utiliza consumo passado e calendário; indicadores epidemiológicos, prazo de entrega, validade e entradas futuras ainda não participam do cálculo."
+    )
+    st.write(
+        "O saldo informado é comparado à demanda acumulada do horizonte, sem reposições intermediárias. As sugestões apoiam a análise do gestor e não executam compras."
+    )
+    st.dataframe(result.history, use_container_width=True, hide_index=True)
+
+
+def render_dashboard(doc_manager=None, user=None):
+    header()
+    with st.sidebar:
+        # --- User badge (quando autenticado) ---
+        if user:
+            user_badge(user.get("full_name", "Usuário"), user.get("role", ""))
+            st.markdown("---")
+
+        section("Configurar análise", "settings-2")
+        modes = ["Demonstração", "Enviar CSV"]
+        files = []
+        if doc_manager and user:
+            files = (
+                doc_manager.get_all_files()
+                if user.get("role") == "admin"
+                else doc_manager.get_user_files(user["username"])
+            )
+            if files:
+                modes.append("Documentos salvos")
+        mode = st.radio("Fonte dos dados", modes)
+        raw = None
+        source = "Arquivo de exemplo local — procedência não validada"
+        try:
+            if mode == "Demonstração":
+                raw = read_csv(ROOT / "data" / "samples" / "datasus_sample.csv")
+            elif mode == "Enviar CSV":
+                uploaded = st.file_uploader("Histórico mensal (.csv)", type=["csv"])
+                st.caption(
+                    "Obrigatórias: medicamento, data, consumo, estoque_atual. Opcional: unidade."
+                )
+                if uploaded:
+                    raw = read_csv(uploaded)
+                    source = f"Arquivo enviado: {uploaded.name} — origem declarada pelo usuário"
+            else:
+                file_ids = {item["file_id"]: item for item in files}
+                chosen = st.selectbox(
+                    "Documento",
+                    list(file_ids),
+                    format_func=lambda key: file_ids[key]["original_name"],
+                )
+                raw = doc_manager.load_csv_to_dataframe(chosen)
+                source = f"Documento salvo: {file_ids[chosen]['original_name']} — origem declarada pelo usuário"
+        except (ValueError, OSError, UnicodeError) as error:
+            st.error(f"Não foi possível ler o CSV: {error}")
+        months = st.slider("Horizonte de previsão (meses)", 1, 6, 3)
+        safety = st.slider("Reserva de segurança (%)", 0, 100, 20, 5) / 100
+        st.caption("Percentual para simulação. Ajuste com o gestor antes de uso operacional.")
+
+    if raw is None:
+        info_box("Selecione uma fonte de dados na barra lateral para iniciar a análise.")
+        return
+
+    # Source note com ícone Lucide file-text
+    st.markdown(
+        f'<div class="source-note">{icon("file-text")}<span>{escape(source)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+    try:
+        with st.spinner("Preparando séries, avaliando previsões e calculando riscos…"):
+            result = cached_analysis(raw, months, safety)
+    except ValueError as error:
+        st.error(str(error))
+        return
+
+    if result.skipped:
+        warning_box(
+            f"{len(result.skipped)} série(s) sem histórico suficiente foram excluídas da previsão."
         )
-        
-        return filters
-    
-    def show_header(self):
-        st.title("🏥 Sistema Preditivo de Escassez de Medicamentos")
-        st.markdown("""
-        Dashboard interativo para monitoramento e previsão de consumo de medicamentos essenciais,
-        utilizando Machine Learning e dados do DATASUS.
-        """)
-        st.divider()
-    
-    def show_footer(self):
-        st.divider()
-        st.markdown("""
-        ---
-        **Fonte de Dados:** DATASUS (SIA/SUS) | **Modelo:** Random Forest Regressor | 
-        **Desenvolvido para:** Apoio à Gestão de Saúde Pública
-        
-        *Os dados utilizados são agregados e anônimos, em conformidade com a LGPD.*
-        """)
+        with st.expander("Ver séries não analisadas"):
+            st.write("\n\n".join(result.skipped))
+
+    latest = pd.Period(result.history["data"].max(), freq="M")
+    if latest < pd.Period(pd.Timestamp.today(), freq="M") - 1:
+        warning_box(
+            f"O histórico termina em {latest}. Os alertas representam esse período, não o estoque de hoje."
+        )
+
+    with st.sidebar:
+        st.markdown("---")
+        units = st.multiselect(
+            "Unidades",
+            sorted(result.risks["unidade"].unique()),
+            default=sorted(result.risks["unidade"].unique()),
+        )
+        levels = st.multiselect("Níveis de risco", list(RISK_COLORS), default=list(RISK_COLORS))
+
+    risks = result.risks[
+        result.risks["unidade"].isin(units) & result.risks["nivel_risco"].isin(levels)
+    ]
+
+    show_kpis(risks)
+
+    overview, forecasts, method = st.tabs(["Visão geral", "Demanda e estoque", "Método e dados"])
+
+    with overview:
+        section(
+            "Prioridades de abastecimento",
+            "triangle-alert",
+            f"Demanda acumulada de {months} mês(es) após o último registro · reserva de {safety:.0%}",
+        )
+        show_alerts(risks)
+
+        left, right = st.columns([1, 2])
+        with left:
+            section("Situação do estoque", "shield-check")
+            counts = risks["nivel_risco"].value_counts()
+            if counts.empty:
+                info_box("Nenhuma série nos filtros selecionados.")
+            else:
+                fig = go.Figure(
+                    go.Pie(
+                        labels=counts.index,
+                        values=counts.values,
+                        hole=0.72,
+                        marker_colors=[RISK_COLORS[level] for level in counts.index],
+                        textinfo="value",
+                        sort=False,
+                        textfont=dict(size=14, family="Inter, sans-serif"),
+                    )
+                )
+                fig.update_layout(
+                    annotations=[
+                        dict(
+                            text=f"<b>{len(risks)}</b><br><span style='font-size:12px'>séries</span>",
+                            x=0.5,
+                            y=0.5,
+                            showarrow=False,
+                            font=dict(size=20, family="Inter, sans-serif", color="#0f2b27"),
+                        )
+                    ]
+                )
+                st.plotly_chart(chart_style(fig), use_container_width=True)
+
+        with right:
+            section(
+                "Prioridade pelo índice de risco",
+                "trending-up",
+                "Necessidade total em relação ao saldo; permite comparar apresentações diferentes.",
+            )
+            ranking = (
+                risks[np.isfinite(risks["indice_risco"])]
+                .nlargest(8, "indice_risco")
+                .sort_values("indice_risco")
+            )
+            if not ranking.empty:
+                fig = go.Figure(
+                    go.Bar(
+                        x=ranking["indice_risco"],
+                        y=ranking["medicamento"] + " / " + ranking["unidade"],
+                        orientation="h",
+                        marker_color=[RISK_COLORS[level] for level in ranking["nivel_risco"]],
+                        marker_line_width=0,
+                        text=ranking["indice_risco"].round(2),
+                        textposition="outside",
+                        textfont=dict(size=11, family="Inter, sans-serif"),
+                    )
+                )
+                fig.add_vline(x=1.3, line_dash="dot", line_color="#b03028", line_width=1.5)
+                st.plotly_chart(chart_style(fig), use_container_width=True)
+            st.caption(
+                "Saldos zero e desconhecidos são exibidos na tabela, fora da escala do gráfico."
+            )
+
+        section("Plano de acompanhamento", "package")
+        show_risk_table(risks)
+        export = risks.assign(
+            fonte=source, horizonte_meses=months, percentual_seguranca=safety * 100
+        )
+        # Botão de download com ícone Lucide inline
+        st.markdown(
+            f'<div class="download-label">{icon("download")} Exportar análise em CSV</div>',
+            unsafe_allow_html=True,
+        )
+        st.download_button(
+            "Baixar CSV",
+            export.to_csv(index=False).encode("utf-8-sig"),
+            file_name="analise_abastecimento.csv",
+            mime="text/csv",
+        )
+
+    with forecasts:
+        section("Consumo observado e previsão", "trending-up")
+        show_forecast(result, risks)
+
+    with method:
+        show_method(result, months, safety, source)
+
+    st.markdown(
+        f'<div class="footer">'
+        f'<span>{icon("activity")} <strong>MED / RISCO</strong> · Protótipo Acadêmico · IFCE</span>'
+        f'<span>{icon("hospital")} Gestão de abastecimento farmacêutico · Crato · Ceará</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
