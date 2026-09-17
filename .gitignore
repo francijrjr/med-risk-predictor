@@ -4,6 +4,6 @@ __pycache__/
 .pytest_cache/
 .streamlit/secrets.toml
 data/users.json
-data/uploads/
+data/uploads/*.json
 artifacts/
 .env
