@@ -1,116 +1,67 @@
-import pandas as pd
+"""Chronological recursive holdout evaluation, followed by a full-history fit."""
+
 import numpy as np
+import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-import pickle
-from typing import Tuple, Dict
-import sys
-import os
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from src.features.engineering import FEATURE_COLUMNS, FeatureEngineer
 
-class MedicationPredictor:
-    def __init__(self, n_estimators: int = 100, max_depth: int = 10, random_state: int = 42):
-        self.model = RandomForestRegressor(
-            n_estimators=n_estimators,
-            max_depth=max_depth,
-            random_state=random_state,
-            n_jobs=-1,
-            min_samples_split=5,
-            min_samples_leaf=2
-        )
-        self.feature_names = []
-        self.metrics = {}
-    
-    def prepare_data(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
-        exclude_cols = ['medicamento', 'data', 'consumo', 'estoque_atual', 'data_dt']
-        feature_cols = [col for col in df.columns if col not in exclude_cols]
-        
-        X = df[feature_cols].copy()
-        y = df['consumo'].copy()
-        X = X.replace([np.inf, -np.inf], np.nan)
-        X = X.fillna(0)
-        
-        self.feature_names = feature_cols
-        
-        return X, y
-    
-    def train(self, X: pd.DataFrame, y: pd.Series, test_size: float = 0.2) -> Dict[str, float]:
-        print("Iniciando treinamento do modelo...")
 
-        split_idx = int(len(X) * (1 - test_size))
-        X_train, X_test = X[:split_idx], X[split_idx:]
-        y_train, y_test = y[:split_idx], y[split_idx:]
+def make_model():
+    return RandomForestRegressor(
+        n_estimators=100, max_depth=8, min_samples_leaf=2, random_state=42, n_jobs=-1
+    )
 
-        self.model.fit(X_train, y_train)
 
-        y_pred_train = self.model.predict(X_train)
-        y_pred_test = self.model.predict(X_test)
-
-        self.metrics = {
-            'train_mae': mean_absolute_error(y_train, y_pred_train),
-            'train_rmse': np.sqrt(mean_squared_error(y_train, y_pred_train)),
-            'train_r2': r2_score(y_train, y_pred_train),
-            'test_mae': mean_absolute_error(y_test, y_pred_test),
-            'test_rmse': np.sqrt(mean_squared_error(y_test, y_pred_test)),
-            'test_r2': r2_score(y_test, y_pred_test)
+def forecast(model, history: pd.DataFrame, months: int) -> pd.DataFrame:
+    """Recompute lagged inputs after each prediction; never use future observations."""
+    working = history.copy()
+    rows = []
+    for _ in range(months):
+        last = working.iloc[-1]
+        date = str(pd.Period(last["data"], freq="M") + 1)
+        future = {
+            "unidade": last["unidade"],
+            "medicamento": last["medicamento"],
+            "data": date,
+            "consumo": np.nan,
+            "estoque_atual": np.nan,
         }
-        
-        print(f"Treinamento concluído")
-        print(f"  - MAE (teste): {self.metrics['test_mae']:.2f}")
-        print(f"  - RMSE (teste): {self.metrics['test_rmse']:.2f}")
-        print(f"  - R² (teste): {self.metrics['test_r2']:.3f}")
-        
-        return self.metrics
-    
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        X = X[self.feature_names] if self.feature_names else X
-        X = X.replace([np.inf, -np.inf], np.nan)
-        X = X.fillna(0)
-        
-        predictions = self.model.predict(X)
-        predictions = np.maximum(predictions, 0)
-        
-        return predictions
-    
-    def get_feature_importance(self) -> pd.DataFrame:
-        importance_df = pd.DataFrame({
-            'feature': self.feature_names,
-            'importance': self.model.feature_importances_
-        })
-        
-        importance_df = importance_df.sort_values('importance', ascending=False)
-        
-        return importance_df
-    
-    def save_model(self, filepath: str):
-        try:
-            with open(filepath, 'wb') as f:
-                pickle.dump({
-                    'model': self.model,
-                    'feature_names': self.feature_names,
-                    'metrics': self.metrics
-                }, f)
-            print(f"Modelo salvo em {filepath}")
-        except Exception as e:
-            print(f"Erro ao salvar modelo: {e}")
-    
-    def load_model(self, filepath: str):
-        try:
-            with open(filepath, 'rb') as f:
-                data = pickle.load(f)
-                self.model = data['model']
-                self.feature_names = data['feature_names']
-                self.metrics = data['metrics']
-            print(f"✓ Modelo carregado de {filepath}")
-        except Exception as e:
-            print(f"Erro ao carregar modelo: {e}")
+        extended = pd.concat([working, pd.DataFrame([future])], ignore_index=True)
+        features = FeatureEngineer().create_features(extended).iloc[[-1]]
+        value = max(0.0, float(model.predict(features[FEATURE_COLUMNS])[0]))
+        rows.append({**future, "consumo_previsto": value})
+        extended.loc[extended.index[-1], "consumo"] = value
+        working = extended
+    return pd.DataFrame(rows)[["unidade", "medicamento", "data", "consumo_previsto"]]
 
 
-def train_medication_model(df: pd.DataFrame) -> Tuple[MedicationPredictor, Dict[str, float]]:
-    predictor = MedicationPredictor()
-    X, y = predictor.prepare_data(df)
-    metrics = predictor.train(X, y)
-    
-    return predictor, metrics
+def train_and_evaluate(history: pd.DataFrame, horizon: int):
+    """One model per unit/medicine. Holdout equals the selected forecast horizon."""
+    if len(history) < 9 + horizon:
+        raise ValueError(
+            f"São necessários pelo menos {9 + horizon} meses para avaliar esse horizonte."
+        )
+    train, test = history.iloc[:-horizon], history.iloc[-horizon:]
+    features = FeatureEngineer().create_features(train).dropna(subset=FEATURE_COLUMNS)
+    model = make_model()
+    model.fit(features[FEATURE_COLUMNS], features["consumo"])
+    predicted = forecast(model, train, horizon)["consumo_previsto"].to_numpy()
+    actual = test["consumo"].to_numpy()
+    baseline = np.repeat(train["consumo"].iloc[-1], horizon)
+    metrics = {
+        "unidade": history["unidade"].iloc[0],
+        "medicamento": history["medicamento"].iloc[0],
+        "mae": mean_absolute_error(actual, predicted),
+        "rmse": np.sqrt(mean_squared_error(actual, predicted)),
+        "r2": r2_score(actual, predicted) if horizon > 1 and np.var(actual) > 0 else np.nan,
+        "mae_baseline": mean_absolute_error(actual, baseline),
+        "treino_ate": train["data"].iloc[-1],
+        "teste_de": test["data"].iloc[0],
+        "teste_ate": test["data"].iloc[-1],
+        "meses_teste": horizon,
+    }
+    all_features = FeatureEngineer().create_features(history).dropna(subset=FEATURE_COLUMNS)
+    model.fit(all_features[FEATURE_COLUMNS], all_features["consumo"])
+    return model, metrics

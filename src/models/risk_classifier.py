@@ -1,149 +1,60 @@
-import pandas as pd
+"""TCC rule: (forecast demand + safety stock) / available stock.
+
+Thresholds are illustrative, not calibrated against municipal shortages.
+"""
+
 import numpy as np
-from typing import Dict, List
-import sys
-import os
+import pandas as pd
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-
-from src.utils.helpers import get_risk_color, get_risk_emoji
+RISK_ORDER = {"Alto": 0, "Médio": 1, "Sem dados": 2, "Baixo": 3}
+RISK_COLORS = {
+    "Alto": "#b83e35",
+    "Médio": "#aa701b",
+    "Baixo": "#227767",
+    "Sem dados": "#6b7280",
+}
 
 
 class RiskClassifier:
-    RISK_LEVELS = {
-        'Alto': {'threshold_min': 0, 'threshold_max': 1.0, 'color': '#FF4B4B', 'emoji': '🔴'},
-        'Médio': {'threshold_min': 1.0, 'threshold_max': 1.2, 'color': '#FFA500', 'emoji': '🟡'},
-        'Baixo': {'threshold_min': 1.2, 'threshold_max': float('inf'), 'color': '#00CC66', 'emoji': '🟢'}
-    }
-    
-    def __init__(self):
-        pass
-    
+    def __init__(self, safety_percentage: float = 0.2):
+        if not 0 <= safety_percentage <= 1:
+            raise ValueError("A reserva de segurança deve estar entre 0% e 100%.")
+        self.safety_percentage = safety_percentage
+
     def classify_risk(self, estoque: float, previsao: float) -> str:
-       
-        if previsao == 0:
-            return 'Baixo'  
-        razao = estoque / previsao   
-        if razao < 1.0:
-            return 'Alto'
-        elif razao < 1.2:
-            return 'Médio'
-        else:
-            return 'Baixo'
-    
+        if pd.isna(estoque) or pd.isna(previsao):
+            return "Sem dados"
+        if estoque < 0 or previsao < 0:
+            raise ValueError("Estoque e previsão não podem ser negativos.")
+        if estoque == 0:
+            return "Alto" if previsao > 0 else "Sem dados"
+        index = previsao * (1 + self.safety_percentage) / estoque
+        if index > 1.3:
+            return "Alto"
+        return "Médio" if index >= 1 else "Baixo"
+
     def classify_batch(self, df: pd.DataFrame) -> pd.DataFrame:
-        df = df.copy()
-        df['nivel_risco'] = df.apply(
-            lambda row: self.classify_risk(
-                row.get('estoque_atual', 0),
-                row.get('consumo_previsto', 0)
-            ),
-            axis=1
+        result = df.copy()
+        result["estoque_seguranca"] = result["consumo_previsto"] * self.safety_percentage
+        result["necessidade_total"] = result["consumo_previsto"] + result["estoque_seguranca"]
+        result["indice_risco"] = result["necessidade_total"] / result["estoque_atual"].replace(
+            0, np.nan
         )
-
-        df['cor_risco'] = df['nivel_risco'].apply(get_risk_color)
-        df['emoji_risco'] = df['nivel_risco'].apply(get_risk_emoji)
-        df['razao_estoque'] = df.apply(
-            lambda row: round(row['estoque_atual'] / row['consumo_previsto'], 2)
-            if row.get('consumo_previsto', 0) > 0 else 0,
-            axis=1
-        )      
-        df['deficit'] = df.apply(
-            lambda row: max(0, row.get('consumo_previsto', 0) - row.get('estoque_atual', 0)),
-            axis=1
+        result.loc[
+            result["estoque_atual"].eq(0) & result["necessidade_total"].gt(0),
+            "indice_risco",
+        ] = np.inf
+        result["deficit"] = (result["necessidade_total"] - result["estoque_atual"]).clip(lower=0)
+        result["nivel_risco"] = [
+            self.classify_risk(s, p)
+            for s, p in zip(result["estoque_atual"], result["consumo_previsto"])
+        ]
+        result["acao_sugerida"] = result["nivel_risco"].map(
+            {
+                "Alto": "Priorizar avaliação de reposição ou redistribuição",
+                "Médio": "Revisar prazo de reposição e acompanhar estoque",
+                "Baixo": "Manter acompanhamento do consumo",
+                "Sem dados": "Conferir saldo e histórico antes de decidir",
+            }
         )
-        
-        return df
-    
-    def get_risk_statistics(self, df: pd.DataFrame) -> Dict[str, int]:
-        if df.empty or 'nivel_risco' not in df.columns:
-            return {'Alto': 0, 'Médio': 0, 'Baixo': 0}
-        
-        risk_counts = df['nivel_risco'].value_counts().to_dict()
-        stats = {
-            'Alto': risk_counts.get('Alto', 0),
-            'Médio': risk_counts.get('Médio', 0),
-            'Baixo': risk_counts.get('Baixo', 0)
-        }
-        
-        return stats
-    
-    def get_high_risk_medications(self, df: pd.DataFrame) -> pd.DataFrame:
-
-        if df.empty or 'nivel_risco' not in df.columns:
-            return pd.DataFrame()
-        
-        high_risk = df[df['nivel_risco'] == 'Alto'].copy()
-
-        if not high_risk.empty and 'deficit' in high_risk.columns:
-            high_risk = high_risk.sort_values('deficit', ascending=False)
-        
-        return high_risk
-    
-    def get_priority_list(self, df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
-
-        if df.empty or 'nivel_risco' not in df.columns:
-            return pd.DataFrame()
-
-        priority = df[df['nivel_risco'].isin(['Alto', 'Médio'])].copy()
-        risk_order = {'Alto': 1, 'Médio': 2, 'Baixo': 3}
-        priority['risk_order'] = priority['nivel_risco'].map(risk_order)
-        priority = priority.sort_values(
-            ['risk_order', 'deficit'],
-            ascending=[True, False]
-        )
-        priority = priority.drop('risk_order', axis=1)
-        
-        return priority.head(top_n)
-    
-    def generate_alert_message(self, row: pd.Series) -> str:
-        medicamento = row.get('medicamento', 'Desconhecido')
-        nivel = row.get('nivel_risco', 'Desconhecido')
-        estoque = row.get('estoque_atual', 0)
-        previsao = row.get('consumo_previsto', 0)
-        deficit = row.get('deficit', 0)
-        emoji = row.get('emoji_risco', '⚪')
-        
-        if nivel == 'Alto':
-            return (f"{emoji} ALERTA: {medicamento} - Estoque insuficiente! "
-                   f"Estoque: {estoque:.0f} | Previsão: {previsao:.0f} | "
-                   f"Déficit: {deficit:.0f}")
-        elif nivel == 'Médio':
-            return (f"{emoji} ATENÇÃO: {medicamento} - Estoque baixo. "
-                   f"Estoque: {estoque:.0f} | Previsão: {previsao:.0f}")
-        else:
-            return (f"{emoji} OK: {medicamento} - Estoque adequado. "
-                   f"Estoque: {estoque:.0f} | Previsão: {previsao:.0f}")
-    
-    def create_risk_report(self, df: pd.DataFrame) -> Dict:
-        stats = self.get_risk_statistics(df)
-        high_risk = self.get_high_risk_medications(df)
-        priority = self.get_priority_list(df)
-        
-        total = len(df)
-        
-        report = {
-            'total_medicamentos': total,
-            'estatisticas': stats,
-            'percentual_alto': round((stats['Alto'] / total * 100), 1) if total > 0 else 0,
-            'percentual_medio': round((stats['Médio'] / total * 100), 1) if total > 0 else 0,
-            'percentual_baixo': round((stats['Baixo'] / total * 100), 1) if total > 0 else 0,
-            'medicamentos_alto_risco': high_risk.to_dict('records') if not high_risk.empty else [],
-            'lista_prioridade': priority.to_dict('records') if not priority.empty else [],
-            'deficit_total': df['deficit'].sum() if 'deficit' in df.columns else 0
-        }
-        
-        return report
-
-
-def classify_medication_risk(predictions: pd.DataFrame, current_stock: pd.DataFrame) -> pd.DataFrame:
-    risk_df = predictions.merge(
-        current_stock[['medicamento', 'estoque_atual']],
-        on='medicamento',
-        how='left'
-    )
-    risk_df['estoque_atual'] = risk_df['estoque_atual'].fillna(0)
-    classifier = RiskClassifier()
-    risk_df = classifier.classify_batch(risk_df)
-    
-    return risk_df
+        return result.sort_values("nivel_risco", key=lambda levels: levels.map(RISK_ORDER))
